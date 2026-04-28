@@ -1854,6 +1854,8 @@ class triton:
     # Should TMA store be enable from templates. TODO: Remove once we
     # can autotune over the result.
     enable_template_tma_store = os.environ.get("ENABLE_TEMPLATE_TMA_STORE", "0") == "1"
+    # Controls TMA load enablement in templates
+    enable_template_tma_load = os.environ.get("ENABLE_TEMPLATE_TMA_LOAD", "0") == "1"
     # Skip L1 cache for buffers that are used only once.  Disabled by default
     skip_l1_cache = os.environ.get("TORCHINDUCTOR_SKIP_L1", "0") == "1"
 
