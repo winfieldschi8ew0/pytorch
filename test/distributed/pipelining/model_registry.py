@@ -362,3 +362,40 @@ class MultiMLPWithDw(torch.nn.Module):
 
         for i in reversed(range(len(self.layers))):
             self.layers[i].compute_dW()
+
+
+class ModelWithDetachedInput(torch.nn.Module):
+    """After pipe_split, the input is detached so backward produces None grad."""
+
+    def __init__(self, d_hid):
+        super().__init__()
+        self.lin0 = torch.nn.Linear(d_hid, d_hid)
+        self.lin1 = torch.nn.Linear(d_hid, d_hid)
+
+    def forward(self, x):
+        a = self.lin0(x)
+        pipe_split()
+        return self.lin1(a.detach())
+
+
+class Stage0WithUnusedOutput(torch.nn.Module):
+    """Stage 0 for manual frontend test: produces two outputs, one unused."""
+
+    def __init__(self, d_hid):
+        super().__init__()
+        self.lin0 = torch.nn.Linear(d_hid, d_hid)
+        self.lin1 = torch.nn.Linear(d_hid, d_hid)
+
+    def forward(self, x):
+        return self.lin0(x), self.lin1(x)
+
+
+class Stage1IgnoresSecondInput(torch.nn.Module):
+    """Stage 1 for manual frontend test: takes two inputs, ignores the second."""
+
+    def __init__(self, d_hid):
+        super().__init__()
+        self.lin = torch.nn.Linear(d_hid, d_hid)
+
+    def forward(self, used, unused):
+        return self.lin(used)

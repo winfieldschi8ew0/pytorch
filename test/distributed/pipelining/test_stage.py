@@ -1,7 +1,14 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
-from model_registry import ExampleCode, ModelWithKwargs, MultiMLP
+from model_registry import (
+    ExampleCode,
+    ModelWithDetachedInput,
+    ModelWithKwargs,
+    MultiMLP,
+    Stage0WithUnusedOutput,
+    Stage1IgnoresSecondInput,
+)
 
 import torch
 import torch.distributed as dist
@@ -419,6 +426,119 @@ class StageNegativeTest(MultiProcContinuousTest):
         stage_with_dw_builder._has_backward = True
         with self.assertRaisesRegex(AssertionError, "backward_one_chunk"):
             stage_with_dw_builder.backward_weight_one_chunk(bwd_chunk_id=0)
+
+
+class NoneGradTest(MultiProcContinuousTest):
+    @classmethod
+    def backend_str(cls) -> str:
+        return backend
+
+    @classmethod
+    def device_type(cls) -> str:
+        return device_type
+
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device(device_type, self.rank)
+
+    @requires_accelerator_dist_backend(["nccl", "xccl"])
+    @skip_but_pass_in_sandcastle_if(
+        not TEST_MULTIACCELERATOR, f"{backend} test requires 2+ GPUs"
+    )
+    def test_traced_detached_input(self):
+        """Traced frontend: stage 1 detaches its input so backward produces None
+        grad for a requires_grad=True input. The fix should send zeros."""
+        mod = ModelWithDetachedInput(d_hid)
+        mod.to(self.device)
+
+        x = torch.randn(batch_size, d_hid, device=self.device)
+        target = torch.randn(batch_size, d_hid, device=self.device)
+        x_mb = x.chunk(chunks)[0]
+
+        pipe = pipeline(mod, mb_args=(x_mb,))
+        stage = pipe.build_stage(self.rank, self.device)
+
+        schedule = ScheduleGPipe(
+            stage, chunks, loss_fn=torch.nn.MSELoss(reduction="sum")
+        )
+
+        if self.rank == 0:
+            schedule.step(x)
+        else:
+            schedule.step(target=target)
+
+    @requires_accelerator_dist_backend(["nccl", "xccl"])
+    @skip_but_pass_in_sandcastle_if(
+        not TEST_MULTIACCELERATOR, f"{backend} test requires 2+ GPUs"
+    )
+    def test_traced_non_requires_grad_input(self):
+        """Traced frontend: ExampleCode has a requires_grad=False buffer crossing
+        the boundary. Backward should skip the send for that input."""
+        mod = ExampleCode(d_hid)
+        mod.to(self.device)
+
+        x = torch.randn(batch_size, d_hid, device=self.device)
+        target = torch.randn(batch_size, d_hid, device=self.device)
+        x_mb = x.chunk(chunks)[0]
+
+        pipe = pipeline(mod, mb_args=(x_mb,))
+        stage = pipe.build_stage(self.rank, self.device)
+
+        schedule = ScheduleGPipe(
+            stage, chunks, loss_fn=torch.nn.MSELoss(reduction="sum")
+        )
+
+        if self.rank == 0:
+            schedule.step(x)
+        else:
+            schedule.step(target=target)
+
+    @requires_accelerator_dist_backend(["nccl", "xccl"])
+    @skip_but_pass_in_sandcastle_if(
+        not TEST_MULTIACCELERATOR, f"{backend} test requires 2+ GPUs"
+    )
+    def test_manual_unused_input(self):
+        """Manual frontend: stage 1 receives two inputs but ignores one.
+        Tests the metadata inference fix (allow_unused=True) and the runtime
+        zero-grad send path."""
+        stage0_mod = Stage0WithUnusedOutput(d_hid)
+        stage1_mod = Stage1IgnoresSecondInput(d_hid)
+
+        if self.rank == 0:
+            stage0_mod.to(self.device)
+            stage = PipelineStage(
+                stage0_mod,
+                self.rank,
+                self.world_size,
+                self.device,
+            )
+        else:
+            stage1_mod.to(self.device)
+            stage = PipelineStage(
+                stage1_mod,
+                self.rank,
+                self.world_size,
+                self.device,
+            )
+
+        x = torch.randn(batch_size, d_hid, device=self.device)
+        target = torch.randn(batch_size, d_hid, device=self.device)
+
+        schedule = ScheduleGPipe(
+            stage, chunks, loss_fn=torch.nn.MSELoss(reduction="sum")
+        )
+
+        if self.rank == 0:
+            schedule.step(x)
+        else:
+            schedule.step(target=target)
+
+
+instantiate_parametrized_tests(NoneGradTest)
 
 
 if __name__ == "__main__":

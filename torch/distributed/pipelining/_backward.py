@@ -235,6 +235,7 @@ def stage_backward_input(
         input_values,
         output_grads,
         retain_graph=True,
+        allow_unused=True,
     )
 
     # Accumulate into .grad
