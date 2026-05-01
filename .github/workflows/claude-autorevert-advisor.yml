@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       signal_pattern:
-        description: "JSON object with signal metadata, failed partition (with job links/log URLs), and successful partition (baseline)"
+        description: "JSON object with signal metadata and a commits[] array (each labeled failed/unknown/successful/prior, with events[] carrying job links, log URLs, and per-test outcome rows for TEST signals)"
         required: true
         type: string
 
@@ -68,13 +68,32 @@ jobs:
             ```
 
             The signal pattern contains:
-            - `signal_key`: the test or job name that defines this signal
-            - `signal_source`: "test" (individual test) or "job" (whole job)
-            - `workflow_name`: the CI workflow where this signal lives
-            - `failed_partition`: commits where this signal FAILS (newest first, suspect commit marked with `is_suspect: true`). Each has job links and log URLs.
-            - `successful_partition`: baseline commits where this signal was GREEN (most recent first). These prove the signal was passing before the suspect commit.
+            - `signal_key`: the **authoritative** identifier of the specific failure on this signal (test path or job name). Treat it as ground truth — every event in the failed partition is a job that exhibits this exact failure. You do NOT need to re-derive which test/job failed from logs; signal extraction has already done so.
+            - `signal_source`: `"test"` (individual test) or `"job"` (whole job).
+            - `workflow_name`: the CI workflow where this signal lives.
+            - `commits[]`: an array of commits with a `partition` label and an `events[]` array of CI observations. Partition labels:
+              - `"failed"` — commits where this signal FAILS, at or after the suspect commit (newest first). The suspect commit is marked with `is_suspect: true`.
+              - `"successful"` — baseline commits where this signal was GREEN before the suspect commit. These prove the signal was passing.
+              - `"unknown"` — commits between failed and successful with no resolved events (pending or missing data).
+              - `"prior"` — older commits before the successful baseline. The signal may have been fixed and then failed again here; do not assume causation from prior failures.
+            - `events[].status`: `"failure"` / `"success"` / `"pending"`. Each event also includes `job_id`, `wf_run_id`, `run_attempt`, `started_at`, and (when `job_id` is set) `url` and `log_url`.
+            - `events[].test_failures` (TEST signals only, when available): a list of `{file, classname, name, failure_runs, success_runs}` rows from `tests.all_test_runs`, attached to the event by `job_id`. These land in ClickHouse **before** the parent `workflow_job` reaches `completed`, so they are usable evidence even when the event's `status` is `"pending"` or its `log_url` is empty.
 
-            The partition is ground truth from CI data. The signal transitioned from SUCCESS to FAILURE at the suspect commit. Your job is to determine whether the CODE CHANGE caused the transition, or whether it's coincidence (upstream dependency change, flaky environment, infra issue).
+            The signal extraction is ground truth: the signal transitioned from SUCCESS to FAILURE at the suspect commit. Your job is to determine whether the CODE CHANGE caused the transition, or whether it's coincidence (upstream dependency change, flaky environment, infra issue).
+
+            ## Partial Visibility Warning
+
+            **Events with `status: "pending"` are NORMAL.** The autorevert system dispatches this advisor as soon as a failure is detected on the suspect commit. At that moment, many other commits' workflow jobs for the same signal are still running (`in_progress`) or queued. They appear as `status: "pending"` in the signal pattern.
+
+            Key implications:
+
+            - A `pending` event means **"this job has not finished yet"** — it is NOT evidence of a stuck or hanging job, NOT evidence of failure, and NOT evidence of flake.
+            - The `failed` partition will often contain mostly pending events. This is expected: the suspect commit's job failed, which triggered the advisor, but newer commits' jobs for the same signal haven't finished yet.
+            - **Do NOT cite pending events as evidence for any verdict.** Pending events carry zero diagnostic signal about whether the job will ultimately pass or fail.
+            - The only events with diagnostic value for status are those with `status: "failure"` (completed and failed) or `status: "success"` (completed and passed).
+            - **`log_url` for pending events will return empty or incomplete data** — the job hasn't finished writing logs yet. This is expected, not a problem.
+            - If the failed partition has very few completed (failure/success) events, that is a **data-availability limitation**, not an infra problem.
+            - For TEST signals, `events[].test_failures` is the most reliable evidence available — it is recorded **before** the parent `workflow_job` reaches `completed`. Use it whenever it is present, even on `pending` events.
 
             ## Investigation Steps
 
@@ -103,11 +122,18 @@ jobs:
                - `revert` — You found a plausible causal chain from the code change to the failure. Confidence should reflect how direct and clear the chain is.
                - `not_related` — After thorough investigation, there is no plausible causal chain. The failure has a clear alternative explanation.
                - `unsure` — The investigation is inconclusive. There may be a connection but you cannot confirm it with sufficient confidence.
-               - `garbage` — The signal itself is unreliable and should be temporarily suppressed. Use this when the failure is clearly not caused by ANY code change: persistent infra flakes (runner timeouts, network errors, GPU driver crashes), environment issues (disk full, dependency mirror outage), or tests so flaky that the signal has no diagnostic value. This tells autorevert to ignore this signal for ~2 hours.
+               - `garbage` — The signal itself is unreliable and should be temporarily suppressed. Use ONLY when you find **concrete, verifiable infrastructure evidence in completed job logs**: HTTP error codes from dependency mirrors, ECR/docker pull failures with specific error messages, runner pool exhaustion errors, GPU driver crash signatures, OOM kills visible in dmesg output, or similar signal-wide infra failures. This tells autorevert to ignore this signal for ~2 hours.
 
-            When in doubt between `unsure` and `not_related`, prefer `unsure`. A false `not_related` verdict is more costly than an `unsure` (which just lets autorevert continue its normal restart-to-confirm flow).
+            **`garbage` guardrails — read carefully, this is the most common failure mode of this advisor:**
 
-            Use `garbage` only when the failure clearly has nothing to do with any code change — it's a statement about the signal quality, not about the suspect commit.
+            - **The most important rule: a `garbage` verdict requires evidence from a `completed` job — i.e., an event with `status: "failure"` (or `status: "success"`) whose `log_url` returned non-empty content with a concrete infra error.** Without that, you do not have evidence; you have a guess.
+            - **NEVER issue `garbage` based on pending events alone.** A failed partition that is mostly `pending` is the normal state at dispatch time, not evidence of infra problems or hanging jobs. The jobs are still running.
+            - **NEVER issue `garbage` because you couldn't fetch logs for pending jobs.** That's expected — the jobs haven't finished writing logs yet. Empty `log_url` from a pending event is not evidence; it is the absence of evidence.
+            - **NEVER call jobs "stuck" or "hanging" based on `status: "pending"`.** "Pending" means "not yet completed", not "hung".
+            - If you cannot find concrete infra evidence in completed job logs, default to `unsure`.
+            - For TEST signals, prefer trusting `events[].test_failures` and the `signal_key`-identified test over speculating about job-level infra. The signal extraction has already pinned which test failed; you do not need to re-derive that.
+
+            When in doubt between `unsure` and `not_related`, prefer `unsure`. When in doubt between `garbage` and `unsure`, prefer `unsure`. A false `not_related` verdict is more costly than an `unsure` (which just lets autorevert continue its normal restart-to-confirm flow). A false `garbage` suppresses the signal for ~2 hours, potentially delaying a legitimate revert.
 
             IMPORTANT: Be thorough. Read actual code. Trace actual call paths. Do not guess based on file names alone.
 
