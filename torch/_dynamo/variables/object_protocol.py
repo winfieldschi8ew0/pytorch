@@ -7,6 +7,7 @@ Per-type hook implementations (bool_impl, richcompare_impl, etc.)
 live in their respective VT files.
 """
 
+import collections
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -26,7 +27,9 @@ from ..exc import (
     raise_observed_exception,
     raise_type_error,
     unimplemented,
+    Unsupported,
 )
+from ..source import GetItemSource
 from ..utils import istype
 from .base import NO_SUCH_SUBOBJ, VariableTracker
 from .constant import ConstantVariable
@@ -296,7 +299,7 @@ def vt_getitem(
 
     Branch 1 is the common path (list, tuple, dict, range all have mp_subscript).
     Branch 2 fires for types with only sq_item (e.g. deque).
-    Branch 3 delegates to mp_subscript_impl for type objects (__class_getitem__).
+    Branch 3 delegates to cpython for builtin types (i.e. type[int] or list[int] - see BaseBuiltinVariable.call_method)
     """
     obj_type = maybe_get_python_type(obj)
     # Branch 1: mp_subscript
@@ -314,11 +317,28 @@ def vt_getitem(
             tx,
             f"{obj_type.__name__} indices must be integers, not {key_type.__name__}",
         )
-    # Branch 3: PyType_Check → __class_getitem__ (abstract.c L183-203)
-    # In 3.10+ type.__getitem__ sets mp_subscript so this is normally caught
-    # by Branch 1, but we check explicitly for safety.
+    # Branch 3: special handling for type objects, otherwise call __class_getitem__
     if issubclass(obj_type, type):
-        return obj.mp_subscript_impl(tx, key)
+        cls = obj.as_python_constant()
+        # TODO get rid of the callable special case
+        if cls is type or cls is collections.abc.Callable:
+            key_py = key.as_python_constant()
+            result = cls[key_py]  # pyrefly: ignore[bad-specialization]
+            source = None
+            if obj.source and key.source:
+                source = GetItemSource(obj.source, key.source)
+            return VariableTracker.build(tx, result, source)
+        try:
+            return obj.call_method(
+                tx,
+                "__class_getitem__",
+                [
+                    key,
+                ],
+                {},
+            )
+        except Unsupported:
+            raise_type_error(tx, f"type '{obj.debug_repr()}' is not subscriptable")
     # CPython: abstract.c L205
     raise_type_error(tx, f"'{obj_type.__name__}' object is not subscriptable")
 
