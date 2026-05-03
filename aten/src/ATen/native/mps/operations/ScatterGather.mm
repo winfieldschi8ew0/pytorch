@@ -279,14 +279,8 @@ static void scatter_reduce_two_mps_kernel(
     case ReductionType::PROD:
       return scatter_mps_general(self, dim, index, src, self, "", "prod");
     case ReductionType::MIN:
-      TORCH_CHECK(
-          self.scalar_type() != kLong,
-          "scatter_reduce min not supported for torch.int64");
       return scatter_mps_general(self, dim, index, src, self, "", "amin");
     case ReductionType::MAX:
-      TORCH_CHECK(
-          self.scalar_type() != kLong,
-          "scatter_reduce max not supported for torch.int64");
       return scatter_mps_general(self, dim, index, src, self, "", "amax");
   }
   TORCH_CHECK(
