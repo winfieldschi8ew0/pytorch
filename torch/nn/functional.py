@@ -1,10 +1,11 @@
 """Functional interface."""
 
+import dataclasses
 import importlib
 import math
 import warnings
 from collections.abc import Callable
-from typing import Any as _Any, Optional, TYPE_CHECKING
+from typing import Any as _Any, Literal, Optional, TYPE_CHECKING
 
 import torch
 from torch import _VF, sym_int as _sym_int, Tensor
@@ -3653,6 +3654,168 @@ def binary_cross_entropy_with_logits(
     )
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
+class LinearCrossEntropyOptions:
+    """Configuration for the chunked implementation of
+    :func:`linear_cross_entropy`.
+
+    The chunked implementation processes the batch dimension in
+    pieces, so the full ``(num_batches, num_classes)`` logits tensor
+    is never materialized at once. The trade-off is a small amount of
+    kernel-launch overhead in exchange for substantially lower peak
+    memory — useful when ``num_classes`` is large relative to
+    ``in_features`` (e.g. an LLM vocabulary head against a
+    comparatively small hidden state).
+
+    Pass ``options=None`` to :func:`linear_cross_entropy` to use the
+    reference implementation (full ``logits = linear(input, weight)``
+    followed by :func:`cross_entropy`). Pass an instance of this class
+    to opt into the chunked path.
+
+    The chunked path supports a subset of
+    :func:`linear_cross_entropy`'s features: ``reduction`` must be
+    ``"mean"`` or ``"sum"``, ``label_smoothing`` must be ``0.0``,
+    ``target`` must contain class indices (``torch.int64``), and the
+    loss must be 2-D (no ``out_features``). If any of those does not
+    hold, the call falls through to the reference implementation
+    regardless of ``options``.
+
+    Example::
+
+        options = LinearCrossEntropyOptions(
+            chunking_method="aspect_ratio:2",
+            acc_dtype=torch.float32,
+        )
+        loss = linear_cross_entropy(
+            input,
+            weight,
+            target,
+            reduction="sum",
+            options=options,
+        )
+    """
+
+    allow_retain_graph: bool = False
+    """Allow ``retain_graph=True`` on backward.
+
+    When ``False`` (default), backward consumes pre-computed gradient
+    buffers in place; a second ``.backward()`` raises ``RuntimeError``.
+
+    When ``True``, the buffers are preserved at the cost of one extra
+    gradient-sized allocation per call.
+
+    Higher-order autograd (gradgrad, forward-mode AD) is unsupported.
+    """
+
+    batch_chunk_size: int | None = None
+    """Number of batch rows processed per chunk.
+
+    The op loops over ``ceil(num_batches / batch_chunk_size)`` chunks.
+    Smaller values reduce peak memory but launch more kernels; the
+    default ``None`` means a single chunk (no actual chunking). If
+    :attr:`chunking_method` is also set and disagrees, its computed
+    value wins and a warning is emitted.
+    """
+
+    chunking_method: str | None = None
+    """Heuristic for selecting :attr:`batch_chunk_size` from input sizes.
+
+    Supported methods:
+
+    - ``"aspect_ratio"`` — picks the chunk size so that each chunk's
+      logits volume ``batch_chunk_size * num_classes`` is roughly the
+      same order as the input volume ``num_batches *
+      in_features``. Suitable when ``num_classes`` is much larger than
+      ``in_features`` (LLM heads).
+    - ``"aspect_ratio:N"`` for ``N >= 1`` — same heuristic, then
+      divides the chunk size by ``N``. Reduces peak memory roughly by
+      a factor of ``N`` at the cost of more chunks.
+    - ``None`` (default) — use :attr:`batch_chunk_size` directly.
+    """
+
+    acc_policy: Literal["memory", "accurate"] = "memory"
+    """Internal-precision policy when :attr:`acc_dtype` differs from
+    the input dtype.
+
+    Controls which intermediate tensors (softmax workspace,
+    input-gradient accumulator) are stored in :attr:`acc_dtype` versus
+    the input dtype:
+
+    - ``"memory"`` (default) — uses :attr:`acc_dtype` only where it's
+      needed for gradient correctness. Lower peak memory.
+    - ``"accurate"`` — uses :attr:`acc_dtype` for more intermediates,
+      noticeably improving input-gradient accuracy when the chunk size
+      is large relative to ``num_classes``. Higher peak memory.
+
+    Has no effect when :attr:`acc_dtype` equals the input dtype.
+    """
+
+    acc_dtype: torch.dtype | None = None
+    """Dtype for internal accumulation. Defaults to the input dtype.
+
+    Mixed-precision is currently limited to ``torch.float16``
+    or ``torch.bfloat16`` input and ``acc_dtype=torch.float32``.
+    """
+
+    def __post_init__(self):
+        if self.acc_policy not in {"memory", "accurate"}:
+            raise ValueError(
+                f"acc_policy must be 'memory' or 'accurate', got {self.acc_policy!r}"
+            )
+        if self.chunking_method is not None:
+            if ":" in self.chunking_method:
+                name, factor = self.chunking_method.split(":", 1)
+            else:
+                name, factor = self.chunking_method, "1"
+            if not (name == "aspect_ratio" and factor.isdigit() and int(factor) > 0):
+                raise ValueError(
+                    f"chunking_method must be 'aspect_ratio', 'aspect_ratio:N' for a positive integer N, or None, "
+                    f"got {self.chunking_method!r}"
+                )
+
+    def _adjust(self, num_batches, in_features, num_classes, dtype):
+        """Adjust options to input sizes and dtype.
+
+        Return a new LinearCrossEntropyOptions object with default
+        chunk sizes adjusted to the actual input sizes.
+        """
+        if self.batch_chunk_size is None:
+            batch_chunk_size = num_batches
+        else:
+            batch_chunk_size = min(self.batch_chunk_size, num_batches)
+
+        if self.chunking_method is not None:
+            if ":" in self.chunking_method:
+                factor = int(self.chunking_method.split(":", 1)[1])
+            else:
+                factor = 1
+
+            # next power-of-2 >= ceil(num_batches * in_features / num_classes)
+            batch_chunk_size = (
+                1 << (-(num_batches // (num_classes // -in_features)) - 1).bit_length()
+            )
+            batch_chunk_size = min(max(batch_chunk_size // factor, 1), num_batches)
+
+            if (
+                self.batch_chunk_size is not None
+                and self.batch_chunk_size != batch_chunk_size
+            ):
+                warnings.warn(
+                    f"Specified batch_chunk_size (={self.batch_chunk_size}) is different"
+                    f" from one (={batch_chunk_size}) computed using chunking method"
+                    f" ('{self.chunking_method}'). Using the latter.",
+                    stacklevel=3,
+                )
+
+        if self.acc_dtype is None:
+            acc_dtype = dtype
+        else:
+            acc_dtype = self.acc_dtype
+        return dataclasses.replace(
+            self, batch_chunk_size=batch_chunk_size, acc_dtype=acc_dtype
+        )
+
+
 def linear_cross_entropy(
     input: Tensor,
     linear_weight: Tensor,
@@ -3662,6 +3825,7 @@ def linear_cross_entropy(
     reduction: str = "mean",
     ignore_index: int | None = None,
     label_smoothing: float = 0.0,
+    options: LinearCrossEntropyOptions | None = None,
 ) -> Tensor:
     r"""Compute the cross entropy loss between inputs, transformed linearly, and target.
 
@@ -3709,7 +3873,13 @@ def linear_cross_entropy(
             Architecture for Computer Vision
             <https://arxiv.org/abs/1512.00567>`__.
             Default: :math:`0.0`.
-
+        options (LinearCrossEntropyOptions, optional): Specify
+            chunking strategy options, see
+            :class:`~torch.nn.LinearCrossEntropyOptions`
+            for more details. Enabling chunking will decrease the
+            memory usage.  To enable reference implementation of
+            ``linear_cross_entropy``, use `options=None`. Default:
+            ``None``.
     Shape:
         - Input: :math:`(in_features)` or :math:`(N, in\_features)`.
         - Linear weight: :math:`(C, in\_features)` or :math:`(C, d_1,
@@ -3750,6 +3920,7 @@ def linear_cross_entropy(
             reduction=reduction,
             ignore_index=ignore_index,
             label_smoothing=label_smoothing,
+            options=options,
         )
     if input.dim() < 1 or input.dim() > 2:
         raise RuntimeError(
@@ -3785,11 +3956,56 @@ def linear_cross_entropy(
         )
     ignore_index = ignore_index if ignore_index is not None else -100
 
+    # K-dim loss (out_features != ()) falls back to the reference
+    # cross_entropy: the chunked op runs softmax over the full
+    # linear_weight.shape[0], not per-position over the num_classes
+    # axis.
+    if (
+        options is not None
+        and reduction in {"mean", "sum"}
+        and label_smoothing == 0.0
+        and target.dtype == torch.int64
+        and not out_features
+    ):
+        if input.dim() == 2:
+            num_batches = input.shape[0]
+            has_batches = True
+        else:
+            num_batches = 1
+            has_batches = False
+            input = input.unsqueeze(0)
+            target = target.unsqueeze(0)
+
+        options = options._adjust(num_batches, in_features, num_classes, input.dtype)
+
+        # global import results a likely circular import
+        import torch.nn._linear_cross_entropy as m
+
+        result = m._linear_cross_entropy_batch_chunked(
+            input,
+            linear_weight,
+            target,
+            weight,
+            reduction,
+            ignore_index,
+            label_smoothing,
+            options.batch_chunk_size,
+            options.acc_policy,
+            options.acc_dtype,
+            not options.allow_retain_graph,
+            input.requires_grad,
+            linear_weight.requires_grad,
+        )[0]
+
+        if not has_batches:
+            result = result.squeeze(0)
+        return result
+
     if out_features:
-        # reshape linear_weight to 2D required by linear
         linear_weight = linear_weight.reshape(
             (math.prod(out_features, start=num_classes), in_features)
         )
+
     logits = linear(input, linear_weight)
     # recover logits shape that corresponds to the shape of specified
     # linear_weight:
