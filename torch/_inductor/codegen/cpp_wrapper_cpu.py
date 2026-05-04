@@ -2384,6 +2384,9 @@ class CppWrapperCpu(PythonWrapperCodegen):
                 self.writeline(f"{outer_output}.reset();")
             self.writeline(f"{outer_output} = {src};")
 
+    def codegen_subgraph_buffer(self, subgraph, outer_inputs, outer_outputs):
+        self.codegen_subgraph(subgraph, outer_inputs, outer_outputs)
+
     def codegen_invoke_subgraph(self, invoke_subgraph):
         raise NotImplementedError(
             "codegen invoke_subgraph is not implemented for cpp wrapper"

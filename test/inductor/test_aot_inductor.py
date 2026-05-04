@@ -1377,6 +1377,74 @@ class AOTInductorTestsTemplate:
             },
         )
 
+    @unittest.skipIf(
+        not IS_BIG_GPU, "Skipping triton backend only since not big GPU (not enough SM)"
+    )
+    @common_utils.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_decompose_k_aoti(self, dtype):
+        if self.device == "cpu":
+            raise unittest.SkipTest("decompose_k is not supported on CPU")
+
+        M, N, K = 32, 32, 32768
+
+        class Model(torch.nn.Module):
+            def forward(self, a, b):
+                return a @ b
+
+        model = Model()
+        example_inputs = (
+            torch.randn(M, K, dtype=dtype, device=self.device),
+            torch.randn(K, N, dtype=dtype, device=self.device),
+        )
+        self.check_model(
+            model,
+            example_inputs,
+            options={
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+            },
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+    @unittest.skipIf(
+        not IS_BIG_GPU, "Skipping triton backend only since not big GPU (not enough SM)"
+    )
+    @common_utils.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_decompose_k_addmm_aoti(self, dtype):
+        if self.device == "cpu":
+            raise unittest.SkipTest("decompose_k is not supported on CPU")
+
+        M, N, K = 32, 32, 32768
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.randn(N, K, dtype=dtype)
+                )
+                self.bias = torch.nn.Parameter(
+                    torch.randn(N, dtype=dtype)
+                )
+
+            def forward(self, a):
+                return torch.nn.functional.linear(a, self.weight, self.bias)
+
+        model = Model()
+        example_inputs = (
+            torch.randn(M, K, dtype=dtype, device=self.device),
+        )
+        self.check_model(
+            model,
+            example_inputs,
+            options={
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+            },
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
     @unittest.skipIf(IS_FBCODE, "Not yet runnable in fbcode")
     def test_seq(self):
         layernorm = torch.nn.LayerNorm(10)
