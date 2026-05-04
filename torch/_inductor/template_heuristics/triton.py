@@ -2123,7 +2123,7 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
                 )
                 # NOTE: Using private origami API (_problem, _hardware, _configs)
                 # This is a known limitation that depends on origami maintainers to expose
-                # these as public APIs. Issue: https://github.com/ROCmSoftwarePlatform/rocm-origami/issues
+                # these as public APIs.
                 topk_results = origami.select_topk_configs(
                     selector._problem,
                     selector._hardware,
