@@ -35,6 +35,14 @@ from torch._dynamo.test_case import TestCase
 from torch._dynamo.testing import normalize_gm
 from torch._export import config
 from torch._export.pass_base import _ExportPassBaseDeprecatedDoNotUse
+from torch._export.serde import register_unsafe_export_callable
+from torch._functorch.predispatch import (
+    _add_batch_dim,
+    _remove_batch_dim,
+    _vmap_decrement_nesting,
+    _vmap_increment_nesting,
+    lazy_load_decompositions,
+)
 from torch._export.utils import (
     get_buffer,
     get_param,
@@ -823,7 +831,17 @@ class TestExport(TestCase):
                 vmapped = torch.vmap(f)(x, y)
                 return vmapped.sum(dim=0)
 
-        ep = export(VmapToAssert(), (torch.zeros(4, 4, 4, 4), torch.zeros(4, 4, 4, 4)))
+        # See comment in test_vmap for why registration is needed.
+        register_unsafe_export_callable(
+            _vmap_increment_nesting,
+            _vmap_decrement_nesting,
+            _add_batch_dim,
+            _remove_batch_dim,
+            lazy_load_decompositions,
+        )
+        ep = export(
+            VmapToAssert(), (torch.zeros(4, 4, 4, 4), torch.zeros(4, 4, 4, 4))
+        )
         exported = ep.module()(torch.ones(4, 4, 4, 4), torch.ones(4, 4, 4, 4))
         eager = VmapToAssert()(torch.ones(4, 4, 4, 4), torch.ones(4, 4, 4, 4))
         self.assertEqual(exported, eager)
@@ -3756,6 +3774,16 @@ graph():
         DYN = torch.export.Dim.DYNAMIC
         inputs = (torch.tensor([1.0, 2.0, 3.0]), torch.tensor([0.1, 0.2, 0.3]))
         dynamic = {"x": {0: DYN}, "y": {0: DYN}}
+        # vmap produces predispatch callable nodes that need to be registered
+        # for serialization. Registration is needed here so that when test_serdes
+        # replaces export() with a mock that calls save/load, the callables are allowed.
+        register_unsafe_export_callable(
+            _vmap_increment_nesting,
+            _vmap_decrement_nesting,
+            _add_batch_dim,
+            _remove_batch_dim,
+            lazy_load_decompositions,
+        )
         ep = torch.export.export(Vmap(), inputs, {}, dynamic_shapes=dynamic)
         self.assertExpectedInline(
             str(ep.graph).strip(),
@@ -3799,7 +3827,9 @@ graph():
     return (sum_2,)""",
         )
         self.assertTrue(torch.allclose(ep.module()(*inputs), Vmap()(*inputs)))
-        ep = export(Vmap(), inputs, {}, dynamic_shapes=dynamic).run_decompositions({})
+        ep = export(Vmap(), inputs, {}, dynamic_shapes=dynamic).run_decompositions(
+            {}
+        )
         self.assertTrue(torch.allclose(ep.module()(*inputs), Vmap()(*inputs)))
 
     @testing.expectedFailureLegacyExportNonStrict  # Old export doesn't work with subclasses
