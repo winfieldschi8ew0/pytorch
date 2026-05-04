@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from typing import Any, Generic, TYPE_CHECKING, TypeVar
 
 import torch
+import torch.distributed.spmd_types as spmd
 import torch.nn as nn
 from torch.autograd import Variable
 from torch.autograd.graph import _MultiHandle
@@ -272,6 +273,7 @@ class FSDPState(_State):
                         fsdp_param_group._module_fqn = module_fqn
 
     @_dynamo_disable
+    @spmd.no_typecheck()
     def _pre_forward(
         self, module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
@@ -314,6 +316,7 @@ class FSDPState(_State):
         return args, kwargs
 
     @_dynamo_disable
+    @spmd.no_typecheck()
     def _post_forward(self, module: nn.Module, input: Any, output: Any) -> Any:
         # When composing with module-hook-based activation checkpointing, the
         # post-backward hook is responsible for the reshard
@@ -362,6 +365,7 @@ class FSDPState(_State):
         return output
 
     @_dynamo_disable
+    @spmd.no_typecheck()
     def _pre_backward(self, grad: torch.Tensor) -> torch.Tensor:
         self._training_state = TrainingState.PRE_BACKWARD
         self._register_root_post_backward_final_callback()
