@@ -13366,6 +13366,39 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 check_lowp=False,
             )
 
+    def test_searchsorted_slice_boundaries_regression(self):
+        def fn(offsets, positions):
+            return torch.searchsorted(offsets[1:], positions, right=True)
+
+        offsets = torch.tensor([0, 3, 7, 12], device=self.device)
+        positions = torch.arange(12, device=self.device)
+
+        self.common(fn, (offsets, positions), check_lowp=False)
+
+    def test_searchsorted_dynamic_slice_boundaries_regression(self):
+        def fn(lengths, positions):
+            offsets = torch.zeros(
+                lengths.shape[0] + 1,
+                dtype=lengths.dtype,
+                device=lengths.device,
+            )
+            offsets[1:] = torch.cumsum(lengths, dim=0)
+            return torch.searchsorted(offsets[1:], positions, right=True)
+
+        lengths = torch.tensor([3, 4, 5], device=self.device)
+        positions = torch.arange(12, device=self.device)
+
+        self.common(fn, (lengths, positions), check_lowp=False)
+
+    def test_bucketize_slice_boundaries_regression(self):
+        def fn(values, offsets):
+            return torch.bucketize(values, offsets[1:], right=True)
+
+        values = torch.arange(12, device=self.device)
+        offsets = torch.tensor([0, 3, 7, 12], device=self.device)
+
+        self.common(fn, (values, offsets), check_lowp=False)
+
     @requires_gpu()
     @skip_if_gpu_halide
     @skip_if_not_triton
