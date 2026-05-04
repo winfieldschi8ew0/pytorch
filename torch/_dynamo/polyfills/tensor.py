@@ -39,7 +39,7 @@ def make_subclass(
     torch.Tensor.__new__
 )
 def tensor_pynew(cls: type[Any], data: torch.Tensor, requires_grad: bool = False, **kwargs: Any) -> Any:
-    return make_subclass(cls, data, requires_grad=requires_grad, **kwargs)
+    return make_subclass(cls, data, requires_grad, **kwargs)
 
 __all__ = [
     "make_subclass",
