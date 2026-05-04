@@ -5652,6 +5652,44 @@ class TestMaxAutotuneAsyncPipelined(TestMaxAutotune, TestEpilogueFusionStaticAna
         with mock.patch.object(AsyncAutotuner, "start", mock_start):
             test_aten_chosen()
 
+    def test_get_results_handles_filtered_choices(self):
+        """
+        Test that AsyncAutotuner.get_results returns inf for choices that were
+        filtered out during precompilation (not in choice_hash_to_future).
+        """
+        from concurrent.futures import Future
+
+        # Clear the cache
+        AsyncAutotuner.choice_hash_to_future.clear()
+
+        # Create mock choices with hash_key methods
+        class MockChoice:
+            def __init__(self, name: str):
+                self.name = name
+
+            def hash_key(self) -> str:
+                return f"mock_hash_{self.name}"
+
+        choice_started = MockChoice("started")
+        choice_filtered = MockChoice("filtered")
+
+        inputs_key = "[test_inputs]"
+
+        # Start only one choice (simulating the other being filtered)
+        started_hash = AsyncAutotuner.get_choice_hash(choice_started, inputs_key)
+        mock_future = Future()
+        mock_future.set_result(0.5)  # Simulated timing
+        AsyncAutotuner.choice_hash_to_future[started_hash] = mock_future
+
+        # get_results is called with BOTH choices (as happens in pipelined autotuning)
+        all_choices = [choice_started, choice_filtered]
+        timings = AsyncAutotuner.get_results(all_choices, inputs_key)
+
+        # The started choice should have its actual timing
+        self.assertEqual(timings[choice_started], 0.5)
+        # The filtered choice should have inf timing (not KeyError)
+        self.assertEqual(timings[choice_filtered], float("inf"))
+
 
 if __name__ == "__main__":
     from torch._inductor.utils import is_big_gpu
