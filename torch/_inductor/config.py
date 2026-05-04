@@ -512,6 +512,14 @@ max_autotune_pointwise = os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE") 
 # enable slow autotuning passes to select gemm algorithms
 max_autotune_gemm = os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM") == "1"
 
+# When True, ``AsyncCompile.triton`` streams ``CompileResult``s from the
+# worker subprocess back over an ``AF_UNIX`` socket as each config
+# finishes, instead of pickling the whole kernel back after every config
+# has compiled. The standard dispatch path drains the stream blockingly
+# into ``compile_results`` before running ``_make_launchers`` —
+# equivalent to today's behavior, just with the work overlapped.
+streaming_compile: bool = os.environ.get("TORCHINDUCTOR_STREAMING_COMPILE") == "1"
+
 inductor_default_autotune_warmup = int(
     os.getenv("TORCHINDUCTOR_DEFAULT_AUTOTUNE_WARMUP", 25)
 )

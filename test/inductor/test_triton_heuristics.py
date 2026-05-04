@@ -2,6 +2,8 @@
 
 import functools
 import os
+import queue
+import threading
 import sys
 import tempfile
 import unittest
@@ -472,6 +474,284 @@ class TestCachingAutotunerPlugin(TestCase):
         revived = CachingAutotuner.__new__(CachingAutotuner)
         revived.__setstate__(state)
         self.assertEqual(revived._plugins, [])
+
+
+class TestStreamingCompilePlugin(TestCase):
+    """Coverage for ``StreamingCompilePlugin``, the synchronization point
+    between ``_bg_drain_kernel`` (the per-kernel daemon thread that drains
+    the worker stream + makes launchers in parallel with inductor codegen)
+    and ``CachingAutotuner.run``'s ``pre_dispatch`` hook.
+
+    The plugin itself is small: it waits for the bg drain to finish via
+    ``handle.drain_complete``, surfaces any drain-side exception, and
+    returns ``DEFER`` so the standard ``run()`` flow's
+    ``autotune_to_one_config`` (which has the input args) handles bench +
+    winner selection."""
+
+    device_type = GPU_TYPE
+
+    @staticmethod
+    def _make_handle(
+        items,
+        *,
+        num_configs=None,
+        launchers=(),
+        drain_done=True,
+        push_launcher_sentinel=True,
+        worker_done=True,
+        worker_elapsed_us=42,
+    ):
+        """Build a ``StreamingCompileHandle`` for tests.
+
+        ``items``: items pre-loaded onto the worker→drain queue
+            (drain-side; tests usually leave this empty since the bg
+            drain itself is mocked out).
+        ``num_configs``: defaults to ``len(items)`` if not given. Set
+            explicitly when you want to control the multi-vs-single-config
+            branch independently of ``items``.
+        ``launchers``: launchers pre-loaded onto the bg-drain → plugin
+            ``launcher_q``, simulating what a real bg drainer would push.
+        ``drain_done``: presets ``drain_complete`` so the plugin doesn't
+            block on it (set False to test the wait path).
+        ``push_launcher_sentinel``: whether to enqueue ``launcher_sentinel``
+            after ``launchers`` (set False to test that pre_dispatch's
+            ``launcher_q.get()`` actually blocks).
+        ``worker_done`` / ``worker_elapsed_us``: simulate the
+            ``_on_task_done`` callback having stashed the worker's
+            elapsed_us. The plugin reads these to emit per-kernel
+            ``compile_time_us``.
+        """
+        from torch._inductor.async_compile import StreamingCompileHandle
+
+        q = queue.Queue()
+        sentinel = object()
+        for item in items:
+            q.put(item)
+        q.put(sentinel)
+        launcher_q = queue.Queue()
+        launcher_sentinel = object()
+        for launcher in launchers:
+            launcher_q.put(launcher)
+        if push_launcher_sentinel:
+            launcher_q.put(launcher_sentinel)
+        evt = threading.Event()
+        if drain_done:
+            evt.set()
+        worker_evt = threading.Event()
+        if worker_done:
+            worker_evt.set()
+        return StreamingCompileHandle(
+            queue=q,
+            sentinel=sentinel,
+            num_configs=num_configs if num_configs is not None else len(items),
+            static_triton_bundle_key=None,
+            drain_complete=evt,
+            launcher_q=launcher_q,
+            launcher_sentinel=launcher_sentinel,
+            kernel_name="test_kernel",
+            worker_done_event=worker_evt,
+            worker_elapsed_us=[worker_elapsed_us],
+            bg_drain_wait_ns=[0],
+        )
+
+    def _make_autotuner(self):
+        args = TestTritonHeuristics._get_cos_kernel_caching_autotuner_args()
+        args["inductor_meta"] = {**args["inductor_meta"], "grid_type": "Grid1D"}
+        return CachingAutotuner(**args)
+
+    def _make_plugin(self):
+        from torch._inductor.async_compile import _make_streaming_compile_plugin
+
+        return _make_streaming_compile_plugin()
+
+    def test_pre_dispatch_no_op_without_handle(self):
+        """No stashed handle → ``pre_dispatch`` is a no-op (returns
+        ``DEFER``)."""
+        from torch._inductor.runtime.triton_heuristics import DEFER
+
+        plugin = self._make_plugin()
+        autotuner = self._make_autotuner()
+        result = plugin.pre_dispatch(autotuner, stream=0)
+        self.assertIs(result, DEFER)
+
+    def test_pre_compile_short_circuits_when_handle_present(self):
+        """Defensive: if anything calls ``precompile()`` on a kernel
+        with a streaming handle, ``pre_compile`` returns non-``DEFER``
+        so the standard precompile path is bypassed."""
+        from torch._inductor.runtime.triton_heuristics import DEFER
+
+        plugin = self._make_plugin()
+        autotuner = self._make_autotuner()
+        autotuner._streaming_compile_handle = self._make_handle([])
+        self.assertIsNot(plugin.pre_compile(autotuner), DEFER)
+
+    def test_pre_compile_defers_without_handle(self):
+        from torch._inductor.runtime.triton_heuristics import DEFER
+
+        plugin = self._make_plugin()
+        autotuner = self._make_autotuner()
+        self.assertIs(plugin.pre_compile(autotuner), DEFER)
+
+    def test_pre_dispatch_single_config_waits_for_drain_no_bench(self):
+        """Single-config kernel (``num_configs == 1``): plugin waits for
+        ``drain_complete`` and proceeds. No bench (no autotuning to do).
+        ``run()``'s standard flow then sees ``len(launchers) == 1`` and
+        skips autotune."""
+        from torch._inductor.runtime.triton_heuristics import DEFER
+
+        plugin = self._make_plugin()
+        autotuner = self._make_autotuner()
+        # Simulate bg-drained single-config state: one launcher, no
+        # launchers pre-loaded onto launcher_q (plugin won't read it).
+        launcher = MagicMock()
+        autotuner.launchers = [launcher]
+        autotuner.compile_results = [MagicMock()]
+        autotuner._streaming_compile_handle = self._make_handle(
+            [], num_configs=1, drain_done=True
+        )
+        autotuner.bench = MagicMock()
+
+        result = plugin.pre_dispatch(autotuner, stream=0)
+
+        self.assertIs(result, DEFER)
+        autotuner.bench.assert_not_called()
+        self.assertEqual(autotuner.launchers, [launcher])
+        self.assertFalse(hasattr(autotuner, "_streaming_compile_handle"))
+
+    def test_pre_dispatch_multi_config_drains_launcher_q_picks_winner(self):
+        """Multi-config kernel: plugin pulls launchers from
+        ``handle.launcher_q`` as the bg drain produces them, benches
+        each, and ``_finalize_autotune_winner`` reduces
+        ``autotuner.launchers`` to ``[winner]``. Bench[i] overlaps with
+        bg drain's ``make_launcher_{i+1}`` (this test exercises the
+        plain post-drain case where launchers are pre-loaded; the
+        overlap behavior follows from ``launcher_q.get()`` being
+        blocking and the bg drain pushing as it goes)."""
+        from torch._inductor.runtime.triton_heuristics import DEFER
+
+        plugin = self._make_plugin()
+        autotuner = self._make_autotuner()
+        # Simulate bg-drain having pushed two launchers + sentinel.
+        launcher_fast, launcher_slow = MagicMock(), MagicMock()
+        launcher_fast.cache_hash = "lf"
+        launcher_slow.cache_hash = "ls"
+        autotuner.launchers = [launcher_fast, launcher_slow]
+        autotuner.compile_results = [MagicMock(), MagicMock()]
+        autotuner._streaming_compile_handle = self._make_handle(
+            [],
+            num_configs=2,
+            launchers=[launcher_fast, launcher_slow],
+            drain_done=True,
+        )
+        # Fast launcher wins.
+        autotuner.bench = MagicMock(side_effect=[1.0, 5.0])
+        autotuner.coordesc_tuner = MagicMock()
+        autotuner.is_statically_launchable = MagicMock(return_value=False)
+        autotuner.save_cache_hook = None
+        autotuner.get_device_interface = MagicMock()
+
+        with patch("torch._dynamo.device_interface.DeviceGuard"):
+            result = plugin.pre_dispatch(autotuner, stream=0)
+
+        self.assertIs(result, DEFER)
+        self.assertEqual(autotuner.bench.call_count, 2)
+        self.assertEqual(autotuner.launchers, [launcher_fast])
+        self.assertFalse(hasattr(autotuner, "_streaming_compile_handle"))
+
+    def test_pre_dispatch_multi_config_overlaps_with_bg_drain(self):
+        """The plugin must consume ``launcher_q`` blocking-style — i.e.
+        it can begin benching as soon as the FIRST launcher arrives,
+        without waiting for the bg drain to finish making all of them.
+        Simulate this by starting ``pre_dispatch`` with an empty
+        launcher_q and a side thread that pushes launchers + sentinel
+        with delays in between, then assert pre_dispatch returns only
+        after consuming all of them."""
+        from torch._inductor.runtime.triton_heuristics import DEFER
+
+        plugin = self._make_plugin()
+        autotuner = self._make_autotuner()
+        launcher_a, launcher_b = MagicMock(), MagicMock()
+        launcher_a.cache_hash = "la"
+        launcher_b.cache_hash = "lb"
+        autotuner.launchers = [launcher_a, launcher_b]
+        autotuner.compile_results = [MagicMock(), MagicMock()]
+        # Empty launcher_q + no sentinel; the side thread pushes them.
+        handle = self._make_handle(
+            [], num_configs=2, launchers=[], push_launcher_sentinel=False
+        )
+        autotuner._streaming_compile_handle = handle
+        autotuner.coordesc_tuner = MagicMock()
+        autotuner.is_statically_launchable = MagicMock(return_value=False)
+        autotuner.save_cache_hook = None
+        autotuner.get_device_interface = MagicMock()
+
+        bench_results = [1.0, 5.0]
+        bench_call_observed = threading.Event()
+
+        def bench_side_effect(*args, **kwargs):
+            bench_call_observed.set()
+            return bench_results.pop(0)
+
+        autotuner.bench = MagicMock(side_effect=bench_side_effect)
+
+        def pusher():
+            handle.launcher_q.put(launcher_a)
+            # Wait until the plugin has actually started benching
+            # launcher_a before we push launcher_b — proves the plugin
+            # didn't block waiting for all launchers up-front.
+            bench_call_observed.wait(timeout=2.0)
+            handle.launcher_q.put(launcher_b)
+            handle.launcher_q.put(handle.launcher_sentinel)
+
+        t = threading.Thread(target=pusher, daemon=True)
+        t.start()
+
+        with patch("torch._dynamo.device_interface.DeviceGuard"):
+            result = plugin.pre_dispatch(autotuner, stream=0)
+        t.join(timeout=2.0)
+
+        self.assertIs(result, DEFER)
+        self.assertEqual(autotuner.bench.call_count, 2)
+        self.assertEqual(autotuner.launchers, [launcher_a])
+
+    def test_pre_dispatch_reraises_drain_exception(self):
+        """If the bg drainer caught an exception (e.g. ``_make_launcher``
+        blew up unexpectedly), it stashes the exception on the autotuner
+        as ``_streaming_drain_exc`` and sets ``drain_complete`` (and
+        also pushes ``launcher_sentinel`` so the plugin's drain loop
+        terminates). The plugin re-raises so the user sees the failure
+        instead of a silent skip."""
+        plugin = self._make_plugin()
+        autotuner = self._make_autotuner()
+        autotuner.launchers = []
+        autotuner.compile_results = []
+        # num_configs=1 → plugin takes the wait-for-drain path, doesn't
+        # try to read launcher_q.
+        autotuner._streaming_compile_handle = self._make_handle(
+            [], num_configs=1, drain_done=True
+        )
+        autotuner._streaming_drain_exc = RuntimeError("boom")
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            plugin.pre_dispatch(autotuner, stream=0)
+
+    def test_pre_dispatch_raises_when_zero_results_streamed(self):
+        """Worker-side total-failure surfaces ``NoTritonConfigsError``
+        when the bg drainer ends with no compile_results AND no launchers."""
+        from torch._inductor.runtime.triton_heuristics import (
+            NoTritonConfigsError,
+        )
+
+        plugin = self._make_plugin()
+        autotuner = self._make_autotuner()
+        autotuner.launchers = []
+        autotuner.compile_results = []
+        autotuner._streaming_compile_handle = self._make_handle(
+            [], num_configs=1, drain_done=True
+        )
+
+        with self.assertRaises(NoTritonConfigsError):
+            plugin.pre_dispatch(autotuner, stream=0)
 
 
 class TestArgumentCloneAndRestore(TestCase):
