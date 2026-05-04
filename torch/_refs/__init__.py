@@ -5270,6 +5270,7 @@ def empty_out(
     out: TensorLikeType,
     memory_format: torch.memory_format | None = None,
 ) -> TensorLikeType:
+    _maybe_resize_out(out, size, memory_format)
     return out
 
 
