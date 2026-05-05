@@ -1,0 +1,8 @@
+name: Auto Run
+on:
+  workflow_dispatch:
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Hello from forked workflow"
