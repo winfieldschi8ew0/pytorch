@@ -25,6 +25,7 @@ from copy import deepcopy
 from functools import partial, reduce
 from itertools import product
 from operator import mul
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import torch
@@ -2583,8 +2584,24 @@ class TestAutograd(TestCase):
         z = x**2 + y * x + y**2
 
         inputs = OrderedDict([("x", x), ("y", y)])
-        with self.assertRaisesRegex(TypeError, "must be a dict"):
-            torch.autograd.grad(z.sum(), inputs)
+        result = torch.autograd.grad(z.sum(), inputs)
+        self.assertIsInstance(result, OrderedDict)
+        self.assertEqual(list(result.keys()), ["x", "y"])
+        self.assertEqual(result["x"], 2 * x + y)
+        self.assertEqual(result["y"], x + 2 * y)
+
+    def test_grad_dict_inputs_mapping_proxy(self):
+        x = torch.randn(2, 2, dtype=torch.double, requires_grad=True)
+        y = torch.randn(2, 2, dtype=torch.double, requires_grad=True)
+        z = x**2 + y * x + y**2
+
+        # MappingProxyType is a Mapping but not OrderedDict, so result is dict
+        inputs = MappingProxyType({"x": x, "y": y})
+        result = torch.autograd.grad(z.sum(), inputs)
+        self.assertIsInstance(result, dict)
+        self.assertNotIsInstance(result, OrderedDict)
+        self.assertEqual(result["x"], 2 * x + y)
+        self.assertEqual(result["y"], x + 2 * y)
 
     def test_grad_dict_inputs_materialize_grads(self):
         x = torch.randn(2, 2, dtype=torch.double, requires_grad=True)

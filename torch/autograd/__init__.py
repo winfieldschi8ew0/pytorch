@@ -9,6 +9,7 @@ half, float, double and bfloat16) and complex :class:`Tensor` types (cfloat, cdo
 """
 
 import warnings
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from typing import cast, overload
 
@@ -258,7 +259,7 @@ def backward(
     retain_graph: bool | None = None,
     create_graph: bool = False,
     grad_variables: _TensorOrOptionalTensors | None = None,
-    inputs: _TensorOrTensorsOrGradEdge | dict[str, torch.Tensor] | None = None,
+    inputs: _TensorOrTensorsOrGradEdge | Mapping[str, torch.Tensor] | None = None,
 ) -> None:
     r"""Compute the sum of gradients of given tensors with respect to graph leaves.
 
@@ -311,11 +312,11 @@ def backward(
         create_graph (bool, optional): If ``True``, graph of the derivative will
             be constructed, allowing to compute higher order derivative products.
             Defaults to ``False``.
-        inputs (Sequence[Tensor] or Tensor or Sequence[GradientEdge] or dict[str, Tensor], optional):
+        inputs (Sequence[Tensor] or Tensor or Sequence[GradientEdge] or Mapping[str, Tensor], optional):
             Inputs w.r.t. which the gradient will be accumulated into ``.grad``.
             All other Tensors will be ignored. If not provided, the gradient is
             accumulated into all the leaf Tensors that were used to compute the
-            :attr:`tensors`. A dict of tensors (e.g.
+            :attr:`tensors`. A mapping of tensors (e.g.
             ``dict(model.named_parameters())``) is also accepted, in which case
             the values are used as the input tensors.
     """
@@ -348,14 +349,9 @@ def backward(
         inputs_tuple = cast(
             tuple[torch.Tensor, ...] | tuple[graph.GradientEdge, ...], (inputs,)
         )
-    elif type(inputs) is dict:
+    elif isinstance(inputs, Mapping):
         # pyrefly: ignore [bad-argument-type]
         inputs_tuple = tuple(inputs.values())
-    elif isinstance(inputs, Mapping):
-        raise TypeError(
-            f"`inputs` argument to `backward()` must be a dict, not {type(inputs).__name__}. "
-            "Other Mapping types are not supported."
-        )
     else:
         # pyrefly: ignore [bad-argument-type]
         inputs_tuple = tuple(inputs)
@@ -420,7 +416,7 @@ def grad(
 @overload
 def grad(
     outputs: _TensorOrTensorsOrGradEdge,
-    inputs: dict[str, torch.Tensor],
+    inputs: Mapping[str, torch.Tensor],
     grad_outputs: _TensorOrOptionalTensors | None = ...,
     retain_graph: bool | None = ...,
     create_graph: bool = ...,
@@ -433,7 +429,7 @@ def grad(
 
 def grad(
     outputs: _TensorOrTensorsOrGradEdge,
-    inputs: _TensorOrTensorsOrGradEdge | dict[str, torch.Tensor],
+    inputs: _TensorOrTensorsOrGradEdge | Mapping[str, torch.Tensor],
     grad_outputs: _TensorOrOptionalTensors | None = None,
     retain_graph: bool | None = None,
     create_graph: bool = False,
@@ -463,9 +459,9 @@ def grad(
 
     Args:
         outputs (sequence of Tensor or GradientEdge): outputs of the differentiated function.
-        inputs (sequence of Tensor or GradientEdge or dict[str, Tensor]): Inputs w.r.t. which
+        inputs (sequence of Tensor or GradientEdge or Mapping[str, Tensor]): Inputs w.r.t. which
             the gradient will be returned (and not accumulated into ``.grad``).
-            When a dict is provided (e.g. ``dict(model.named_parameters())``),
+            When a mapping is provided (e.g. ``dict(model.named_parameters())``),
             the result is returned as a dict with matching keys.
         grad_outputs (sequence of [Tensor or None] or Tensor, optional): The "vector" in the
             vector-Jacobian product. Usually gradients w.r.t. each output. None values can be
@@ -519,14 +515,9 @@ def grad(
         inputs_tuple = cast(
             tuple[torch.Tensor, ...] | tuple[graph.GradientEdge, ...], (inputs,)
         )
-    elif type(inputs) is dict:
+    elif isinstance(inputs, Mapping):
         # pyrefly: ignore [bad-argument-type]
         inputs_tuple = tuple(inputs.values())
-    elif isinstance(inputs, Mapping):
-        raise TypeError(
-            f"`inputs` argument to `grad()` must be a dict, not {type(inputs).__name__}. "
-            "Other Mapping types are not supported."
-        )
     else:
         # pyrefly: ignore [bad-argument-type]
         inputs_tuple = tuple(inputs)
@@ -550,7 +541,9 @@ def grad(
             is_grads_batched=is_grads_batched,
             materialize_grads=materialize_grads,
         )
-        if type(inputs) is dict:
+        if isinstance(inputs, Mapping):
+            if isinstance(inputs, OrderedDict):
+                return OrderedDict(zip(inputs.keys(), result_tuple, strict=True))
             return dict(zip(inputs.keys(), result_tuple, strict=True))
         return result_tuple
 
@@ -616,7 +609,9 @@ def grad(
                 strict=True,
             )
         )
-    if type(inputs) is dict:
+    if isinstance(inputs, Mapping):
+        if isinstance(inputs, OrderedDict):
+            return OrderedDict(zip(inputs.keys(), result, strict=True))
         return dict(zip(inputs.keys(), result, strict=True))
     return result
 
